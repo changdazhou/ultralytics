@@ -1,5 +1,7 @@
 # Ultralytics YOLO 🚀, AGPL-3.0 license
 
+import os
+import torch
 import shutil
 import subprocess
 import sys
@@ -797,6 +799,10 @@ def entrypoint(debug=""):
         model = YOLO(model, task=task)
     if isinstance(overrides.get("pretrained"), str):
         model.load(overrides["pretrained"])
+        
+    if os.environ.get("FLAG_TORCH_COMPILE",'False').lower() in ['true','yes','t','1'] :
+        LOGGER.info("🔥 Compiling model...")
+        model.model = torch.compile(model.model)
 
     # Task Update
     if task != model.task:

@@ -9,6 +9,7 @@ Usage:
 import gc
 import math
 import os
+import collections
 import subprocess
 import time
 import warnings
@@ -53,6 +54,49 @@ from ultralytics.utils.torch_utils import (
     strip_optimizer,
     torch_distributed_zero_first,
 )
+
+class SmoothedValue(object):
+    """Track a series of values and provide access to smoothed values over a
+    window or the global series average.
+    """
+
+    def __init__(self, window_size=20, fmt=None):
+        if fmt is None:
+            fmt = "{median:.4f} ({avg:.4f})"
+        self.deque = collections.deque(maxlen=window_size)
+        self.fmt = fmt
+        self.total = 0.
+        self.count = 0
+
+    def update(self, value, n=1):
+        self.deque.append(value)
+        self.count += n
+        self.total += value * n
+
+    @property
+    def median(self):
+        return np.median(self.deque)
+
+    @property
+    def avg(self):
+        return np.mean(self.deque)
+
+    @property
+    def max(self):
+        return np.max(self.deque)
+
+    @property
+    def value(self):
+        return self.deque[-1]
+
+    @property
+    def global_avg(self):
+        return self.total / self.count
+
+    def __str__(self):
+        return self.fmt.format(
+            median=self.median, avg=self.avg, max=self.max, value=self.value)
+
 
 
 class BaseTrainer:
@@ -346,7 +390,7 @@ class BaseTrainer:
         self.optimizer.zero_grad()  # zero any resumed gradients to ensure stability on train start
         while True:
             self.epoch = epoch
-            self.run_callbacks("on_train_epoch_start")
+            # self.run_callbacks("on_train_epoch_start")
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # suppress 'Detected lr_scheduler.step() before optimizer.step()'
                 self.scheduler.step()
@@ -354,18 +398,22 @@ class BaseTrainer:
             self.model.train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
-            pbar = enumerate(self.train_loader)
+            # pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
                 self._close_dataloader_mosaic()
                 self.train_loader.reset()
 
-            if RANK in {-1, 0}:
-                LOGGER.info(self.progress_string())
-                pbar = TQDM(enumerate(self.train_loader), total=nb)
+            # if RANK in {-1, 0}:
+                # LOGGER.info(self.progress_string())
+                # pbar = TQDM(enumerate(self.train_loader), total=nb)
             self.tloss = None
-            for i, batch in pbar:
-                self.run_callbacks("on_train_batch_start")
+            data_time=SmoothedValue(1, fmt="{avg:.4f}")
+            batch_time=SmoothedValue(1, fmt="{avg:.4f}")
+            iter_tic = time.time()
+            for i, batch in enumerate(self.train_loader):
+                # self.run_callbacks("on_train_batch_start")
+                data_time.update(time.time() - iter_tic)
                 # Warmup
                 ni = i + nb * epoch
                 if ni <= nw:
@@ -406,23 +454,35 @@ class BaseTrainer:
                             self.stop = broadcast_list[0]
                         if self.stop:  # training time exceeded
                             break
-
+                        
+                
+                batch_time.update(time.time() - iter_tic)
+                ips = float(self.args.batch) / batch_time.avg
                 # Log
+                space_fmt = ':' + str(len(str(nb))) + 'd'
                 if RANK in {-1, 0}:
                     loss_length = self.tloss.shape[0] if len(self.tloss.shape) else 1
-                    pbar.set_description(
-                        ("%11s" * 2 + "%11.4g" * (2 + loss_length))
-                        % (
-                            f"{epoch + 1}/{self.epochs}",
-                            f"{self._get_memory():.3g}G",  # (GB) GPU memory util
-                            *(self.tloss if loss_length > 1 else torch.unsqueeze(self.tloss, 0)),  # losses
-                            batch["cls"].shape[0],  # batch size, i.e. 8
-                            batch["img"].shape[-1],  # imgsz, i.e 640
-                        )
-                    )
+                    fmt = ' '.join([
+                        'Epoch: [{}]',
+                        '[{' + space_fmt + '}/{}]',
+                        'batch_cost: {btime}',
+                        'data_cost: {dtime}',
+                        'ips: {ips:.4f} images/s'
+                    ])
+                    fmt = fmt.format(
+                        f"{epoch + 1}",
+                        i,
+                        nb,
+                        btime=str(batch_time),
+                        dtime=str(data_time),
+                        ips=ips)
+
+                    LOGGER.info(fmt)
+                    
                     self.run_callbacks("on_batch_end")
                     if self.args.plots and ni in self.plot_idx:
                         self.plot_training_samples(batch, ni)
+                iter_tic = time.time()
 
                 self.run_callbacks("on_train_batch_end")
 
@@ -432,13 +492,13 @@ class BaseTrainer:
                 final_epoch = epoch + 1 >= self.epochs
                 self.ema.update_attr(self.model, include=["yaml", "nc", "args", "names", "stride", "class_weights"])
 
-                # Validation
-                if self.args.val or final_epoch or self.stopper.possible_stop or self.stop:
+                # # Validation
+                if self.args.val or self.stopper.possible_stop or self.stop:
                     self.metrics, self.fitness = self.validate()
                 self.save_metrics(metrics={**self.label_loss_items(self.tloss), **self.metrics, **self.lr})
                 self.stop |= self.stopper(epoch + 1, self.fitness) or final_epoch
-                if self.args.time:
-                    self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
+                # if self.args.time:
+                #     self.stop |= (time.time() - self.train_time_start) > (self.args.time * 3600)
 
                 # Save model
                 if self.args.save or final_epoch:
@@ -471,7 +531,7 @@ class BaseTrainer:
             # Do final val with best.pt
             seconds = time.time() - self.train_time_start
             LOGGER.info(f"\n{epoch - self.start_epoch + 1} epochs completed in {seconds / 3600:.3f} hours.")
-            self.final_eval()
+            # self.final_eval()
             if self.args.plots:
                 self.plot_metrics()
             self.run_callbacks("on_train_end")
